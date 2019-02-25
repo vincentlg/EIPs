@@ -4,7 +4,7 @@
 ---  
 eip: native-meta-transactions  
 title: Native Meta Transactions  
-author: Ronan Sandford <[wighawag@gmail.com](mailto:wighawag@gmail.com)>  
+author: Ronan Sandford (@wighawag)  
 discussions-to: XXXX  
 status: Draft  
 type: Standards Track  
