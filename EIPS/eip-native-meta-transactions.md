@@ -55,21 +55,23 @@ We separate ERC20 and ERC777 message type since a token could implement both of 
 For simplicity though, they MUST share the same nonce, allowing us to keep using a singular getter for it.  
   
 Here is the ERC712 message format for ERC20 based meta transactions :  
-```typeHash = keccak256("ERC20MetaTransaction(address from,address to,uint256 amount,bytes data,uint256 nonce,uint256 gasPrice,uint256 gasLimit,uint256 tokenGasPrice,address relayer)");```  
+```typeHash = keccak256("ERC20MetaTransaction(address from,address to,address token,uint256 amount,bytes data,uint256 nonce,uint256 minGasPrice,uint256 txGas,uint256 baseGas,uint256 tokenGasPrice,address relayer)");```  
   
 And here is the one for ERC777 based meta transaction  
   
-```typeHash = keccak256("ERC777MetaTransaction(address from,address to,uint256 amount,bytes data,uint256 nonce,uint256 gasPrice,uint256 gasLimit,uint256 tokenGasPrice,address relayer)");```  
+```typeHash = keccak256("ERC777MetaTransaction(address from,address to,address token,uint256 amount,bytes data,uint256 nonce,uint256 minGasPrice,uint256 txGas,uint256 baseGas,uint256 tokenGasPrice,address relayer)");```  
   
 The meaning of each field is as follow:  
   
 * **from**: the account from which the meta-transaction is executed for and from which the token will be deduced. It MUST be either equal to the resulting message signer or have been given execution rights to the signer (using for example [ERC1271](https://eips.ethereum.org/EIPS/eip-1271))  
 * **to**: the target that will receive the token amount (if any, see below). If it is a contract's address the data(see below) passed will be executed on it. 
+* **token**: token address that will be used for relayer payment and the `amount` field if non-zero. This allows the standard to work for both per-token metatx implementation and general implementation that would support multiple token. 
 * **amount**: the amount in token to be sent to ```to``` (for ERC20 it'll take the form of an temporary approval)  
 * **data**: the bytes to be executed at ```to``` (if empty, a simple transfer will be executed)  
 * **nonce**: a nonce so that messages cannot be replayed. It also ensure the order of transactions. for it to be a valid message the nonce MUST be equal to the current nonce + 1
-* **gasprice**: the gas price in ether to be used for the actual transaction (keeping the user in control) this also prevent attack from a malicious relayer where the logic of the call relies on gasprice (for whatever reason)  
-* **gasLimit**: the exact amount of gas to be used to execute the meta-transaction. This field also prevents attacks that could happen if the logic of the call relies on gas provided for whatever reason. (note though that the total cost of the transaction executing the meta-transaction will obviously have a higher cost)
+* **minGasPrice**: the gas price in ether to be used for the actual transaction (keeping the user in control) but the relayer is free to use a higher gasPrice.
+* **txGas**: the exact amount of gas to be used to execute the meta-transaction. This field also prevents attacks that could happen if the logic of the call relies on gas provided for whatever reason. (note though that the total cost of the transaction executing the meta-transaction will obviously have a higher cost)
+* **baseGas**: As meta tx has extra operation to be performed on top of calling the receiving address, this value determine the minimum gas the relayer will be paid on top. This is thus independent of opcode pricing and relayer are free to reject meta tx with a too low baseGas
 * **tokenGasPrice** the gasPrice set in token, (the relayer will decide to accept meta-transaction or not depending on the value of such). In other word the exchange rate used is defined by ```gasPrice / tokengasPrice``` This separation allow users to set the ether gasPrice to be used, deciding on the speed at which it desire the transaction to be mined
 * **relayer** (optionally set to zero) used to protect the chosen relayer from front running attacks where the intended executor would lose its gas by someone inserting the transaction before. Letting it to be zero (acts as a wildcard) could still be worthwhile for situations where the users would benefit of having different relayers. This is out of scope of this proposal to define how such relayers network would work together. 
   
@@ -86,7 +88,7 @@ Nonces work similarly to normal ethereum transactions: a transaction can only be
   
 When executing the meta-transaction the contract must then verify the signature and if the nonce matches as specified above.  
   
-Then for the case of ERC20 the implementation MUST temporarily change the approval before calling the destination to reflect the amount of token being sent. It MUST NOT emit Approval events for the temporary change of allowance. It also need to ensure that the first parameter of the call being made is equal to ```from```. The receiver will thus be able to accept calls from the token by knowing that the first parameter is indeed the ```from``` and not some arbitrary address. This means only such receiver will be able to accept such meta transactions securely. 
+Then for the case of ERC20 the implementation need to ensure that the first parameter of the call being made is equal to ```from```. The receiver will thus be able to accept calls from the token by knowing that the first parameter is indeed the ```from``` and not some arbitrary address. This means only such receiver will be able to accept such meta transactions securely. 
  
 In order to do it, the receiver simply check if msg.sender is the token contract itself and if so can assume that first parameter is equal to the ```from``` specified as part of the meta transaction message,  
 
@@ -94,7 +96,7 @@ Remember, such ERC20 meta transaction receiver need to have as first parameters 
 
 for example:
 ```
-function receiveERC20Meta(address sender, uint256 value) external {
+function anyMethod(address sender, uint256 value) external {
   require(sender ==  msg.sender ||  msg.sender ==  address(token), "sender has to be the actual sender or the erc20 token contract itself");
   require(value == price, "value != price");
   token.transferFrom(sender, address(this), value);
@@ -102,30 +104,32 @@ function receiveERC20Meta(address sender, uint256 value) external {
   ...
 }
 ``` 
+
+Also for ERC20 the implementation MUST temporarily change the approval before calling the destination to reflect the amount of token being sent. It MUST NOT emit Approval events for the temporary change of allowance. 
+
+An alternative solution would be to let ERC20 increase the allowance and emit the corresponding Approval event and then call the receiver. if the receiver does not actually use the tokens, the allowance will be this different than what it was before hand.
+Note that in this solution, the receiver can spend more if previous allowance was already granted.
   
 For ERC777 tokens, there is no need of such restriction and the receiver will simply use the standard ```tokensReceived(address, address, address, uint256, bytes, bytes)``` hook.   As such, ERC777 meta transactions are able to call any contract that can receive ERC777 tokens via ```tokensReceived``` hook.
+
   
  ### Balance checks 
 To protect from malicious user the executor also need to ensure the user (```from```) has enough balance. While it is technically possible for the user to withdraw token just in time (between the meta-tx is send and mined), it is unlikely to happen since it is unlikely to benefit the user unless it wishes to cancel the last minute. They could achieve a similar feat anyway by publishing a different signed message with the same nonce (albeit at a higher gas cost than a simple transfer). For erc777 they can also conditionally block refund via tokensTosend callback.  This is a risk that need to be taken by the relayer.
   
 ### Gas accounting and refund  
-The ```gasLimit``` set as part of the message represent the gas passed to the contract call made (the meta transaction). This ensure the signer that its call will be executed as intended with as many gas as it asked for. This means though that the total gas cost of the realyer's transaction will be higher than that.
+The ```txGas``` set as part of the message represent the gas passed to the contract call made (the meta transaction). This ensure the signer that its call will be executed as intended with as many gas as it asked for. This means though that the total gas cost of the realyer's transaction will be higher than that.
 
-The token contract SHOULD calculate the refund based on such total. Otherwise the relayer would have hard time to know if the amount of token received would cover the execution cost. 
-
-As for the user, this means that the total token gas cost can only be know if the extra gas required to execute the meta transaction is known. 
-
-This can be achieved by executing the transaction the relayer would execute. It is not part of this standard.
+As mentioned above, this is solved with ```baseGas``` parameter that can be updated if opcode pricing changes.
     
 ### Gas estimate  
-In order to estimate the gasLimit to use for the meta transaction, the meta transaction call data can be used. The behaviour will be identical. As such there is no need to expose an estimateGas function for that.
+In order to estimate the ```txGas``` to use for the meta transaction, the meta transaction call data can be used. The behaviour will be identical. As such there is no need to expose an estimateGas function for that.
 
 As for the extra gas required by the relayer, the whole meta transaction call can be estimated as usual. 
   
   
 ## Example Implementation  
   
-see https://github.com/pixowl/thesandbox-contracts/blob/master/src/Sand/erc20/ERC20MetaTxExtension.sol
+see https://github.com/pixowl/sandbox-smart-contracts/blob/master/src/Sand/erc20/NativeMetaTransactionProcessor.sol
   
 ## wallet / browser  
   
