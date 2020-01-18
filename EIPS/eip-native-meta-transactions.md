@@ -55,35 +55,46 @@ We separate ERC20 and ERC777 message type since a token could implement both of 
 For simplicity though, they MUST share the same nonce, allowing us to keep using a singular getter for it.  
   
 Here is the ERC712 message format for ERC20 based meta transactions :  
-```typeHash = keccak256("ERC20MetaTransaction(address from,address to,address token,uint256 amount,bytes data,uint256 nonce,uint256 minGasPrice,uint256 txGas,uint256 baseGas,uint256 tokenGasPrice,address relayer)");```  
+```typeHash = keccak256("ERC20MetaTransaction(address from,address to,address tokenContract,uint256 amount,bytes data,uint256 batchId,uint256 batchNonce,uint256 expiry,uint256 txGas,uint256 baseGas,uint256 tokenGasPrice,address relayer)");```  
   
 And here is the one for ERC777 based meta transaction  
   
-```typeHash = keccak256("ERC777MetaTransaction(address from,address to,address token,uint256 amount,bytes data,uint256 nonce,uint256 minGasPrice,uint256 txGas,uint256 baseGas,uint256 tokenGasPrice,address relayer)");```  
+```typeHash = keccak256("ERC777MetaTransaction(address from,address to,address tokenContract,uint256 amount,bytes data,uint256 batchId,uint256 batchNonce,uint256 expiry,uint256 txGas,uint256 baseGas,uint256 tokenGasPrice,address relayer)");```  
   
 The meaning of each field is as follow:  
   
 * **from**: the account from which the meta-transaction is executed for and from which the token will be deduced. It MUST be either equal to the resulting message signer or have been given execution rights to the signer (using for example [ERC1271](https://eips.ethereum.org/EIPS/eip-1271))  
 * **to**: the target that will receive the token amount (if any, see below). If it is a contract's address the data(see below) passed will be executed on it. 
-* **token**: token address that will be used for relayer payment and the `amount` field if non-zero. This allows the standard to work for both per-token metatx implementation and general implementation that would support multiple token. 
+* **tokenContract**: token address that will be used for relayer payment and the `amount` field if non-zero. This allows the standard to work for both per-token metatx implementation and general implementation that would support multiple token. 
 * **amount**: the amount in token to be sent to ```to``` (for ERC20 it'll take the form of an temporary approval)  
 * **data**: the bytes to be executed at ```to``` (if empty, a simple transfer will be executed)  
-* **nonce**: a nonce so that messages cannot be replayed. It also ensure the order of transactions. for it to be a valid message the nonce MUST be equal to the current nonce + 1
-* **minGasPrice**: the gas price in ether to be used for the actual transaction (keeping the user in control) but the relayer is free to use a higher gasPrice.
+* **batchId**: Nonces are 2 dimensional, the batchId part can be randomly generated so that meta-transaction that have no prior requirement can be included without waiting for previous meta-tx
+* **batchNonce**: the second part of the nonce, is the batchNonce, that allow a user to batch multiple meta-transaction and ensure they get included in order
+* **expiry**: the time limit at which the meta-transaction must be executed. If that meta-tx do not get executed in time, it reverts at the expense of the relayer.
 * **txGas**: the exact amount of gas to be used to execute the meta-transaction. This field also prevents attacks that could happen if the logic of the call relies on gas provided for whatever reason. (note though that the total cost of the transaction executing the meta-transaction will obviously have a higher cost)
 * **baseGas**: As meta tx has extra operation to be performed on top of calling the receiving address, this value determine the minimum gas the relayer will be paid on top. This is thus independent of opcode pricing and relayer are free to reject meta tx with a too low baseGas
 * **tokenGasPrice** the gasPrice set in token, (the relayer will decide to accept meta-transaction or not depending on the value of such). In other word the exchange rate used is defined by ```gasPrice / tokengasPrice``` This separation allow users to set the ether gasPrice to be used, deciding on the speed at which it desire the transaction to be mined
 * **relayer** (optionally set to zero) used to protect the chosen relayer from front running attacks where the intended executor would lose its gas by someone inserting the transaction before. Letting it to be zero (acts as a wildcard) could still be worthwhile for situations where the users would benefit of having different relayers. This is out of scope of this proposal to define how such relayers network would work together. 
   
-### nonce 
+### batch and nonce 
 In order for the wallet or application to request a valid meta transaction it needs to be able to know the current nonce
 
 The token contract MUST implement a getter for the current nonce as follow:  
   
-```function meta_nonce(address from) external returns (uint256);```  
+```function meta_nonce(address from, uint256 batchId) external view returns(uint256);```  
   
 Nonces work similarly to normal ethereum transactions: a transaction can only be executed if it matches the last nonce + 1, and once a transaction has occurred, the `lastNonce` will be updated to the current one. This prevents transactions to be executed out of order or more than once.  
+
+But instead of being one-dimensional, each nonce is actually associated to a batchId. This is offer great flexibility to the user and allow them to batch meta-transaction together if so desried while still allowing them to submit other meta-tx in paralel.
   
+### expiry and EIP-1681
+
+While a previous version of this standard was using a `minGasPrice` to ensure that the user meta-transaction get included at a minimum price, such field becomes unecessary if we have an `expiry` field that have also a more meaningful purpose.
+
+One of the danger, `minGasPrice` were protecting against, was relayers that would include the tx at a very low gas price to get a higher profit. With an `expiry` field, the relayer has to ensure the gasPrice is adequate so that the meta-tx is included in time. 
+
+On the other hand, the relayer is now risking to submit the transaction just a bit too late. To solve this, we can rely on [EIP-1681](https://eips.ethereum.org/EIPS/eip-1681) that can ensure the relayers that if the cannot get included after the expiry time-limit.
+
 ### execute transaction and receiver verification  
   
 When executing the meta-transaction the contract must then verify the signature and if the nonce matches as specified above.  
@@ -119,13 +130,23 @@ To protect from malicious user the executor also need to ensure the user (```fro
 ### Gas accounting and refund  
 The ```txGas``` set as part of the message represent the gas passed to the contract call made (the meta transaction). This ensure the signer that its call will be executed as intended with as many gas as it asked for. This means though that the total gas cost of the realyer's transaction will be higher than that.
 
-As mentioned above, this is solved with ```baseGas``` parameter that can be updated if opcode pricing changes.
+As mentioned above, this is solved with ```baseGas``` parameter that can be updated if opcode pricing changes. While this might feel like yet another extra field, it is important to note that the alternative (not having it) is worse since either the smart contract hard code the extra gas or the relayer have to pay the cost.
     
 ### Gas estimate  
 In order to estimate the ```txGas``` to use for the meta transaction, the meta transaction call data can be used. The behaviour will be identical. As such there is no need to expose an estimateGas function for that.
 
 As for the extra gas required by the relayer, the whole meta transaction call can be estimated as usual. 
   
+### Relayer cooperations
+
+One possibility that remains a problem for relayers is that a user could submit the meta-tx message and signature to multiple relayer at once.
+This possibility pose a problem to relayers as they run the risk that their tx get included after another. 
+
+With the addition of expiry, we could imagine a simple method to avoid such issues:
+
+Every meta-tx that include both an expiry field and relayer field, can always be included in a block if it reaches before `expiry`. If the nonce is already used, the actual meta-tx is not executed, but the relayer is getting rewarded for the gas spent (+ `baseGas`).
+
+This would ensure relayers that they get paid for the work they do, while still allowing users to choose which relayer they want. The expiry field would also allow.
   
 ## Example Implementation  
   
